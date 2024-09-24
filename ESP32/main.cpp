@@ -23,17 +23,21 @@ Adafruit_SSD1306 display(128, 64, &Wire, -1);
 //PMS5003T使用了ESP32內建的UART，使用串口2
 //SSD1306使用I2C連接，此處需定義螢幕長度、寬度（若無reset針腳則在最後填入-1）
 
+TaskHandle_t uploadData;
+TimerHandle_t timer;
+
 void setup() {
   Serial.begin(115200);
   xTaskCreate(TaskReadPMS, "Read PMS Sensor", 1500, NULL, 1, NULL);
   xTaskCreate(TaskReadSoilrh, "Read Soil Sensor", 1200, NULL, 2, NULL);
-  xTaskCreate(TaskUploadData, "Upload Data", 3500, NULL, 1, NULL);
+  xTaskCreate(TaskUploadData, "Upload Data", 3500, NULL, 1, &uploadData);
   xTaskCreate(TaskWiFi, "WiFi connect", 3000, NULL, 1, NULL);
 
   xTaskCreatePinnedToCore(TaskOTA, "OTA", 2000, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(TaskDisp, "Screen", 3000, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(TaskButton, "Button", 2000, NULL, 1, NULL, 0);
-  delay(10000);
+
+  timer = xTimerCreate("WiFi connection timer", (180000 / portTICK_PERIOD_MS), pdFALSE, (void *)1, wifiRestart);
 }
 void loop() {
 }
@@ -43,6 +47,8 @@ void TaskWiFi(void *pvParam) {
   WiFi.begin("---------", "---------");
   while (1) {
     if (WiFi.status() != WL_CONNECTED) {
+      vTaskSuspend(uploadData);
+      xTimerStart(timer, 0);
       while (WiFi.status() != WL_CONNECTED) {
         vTaskDelay(100 / portTICK_PERIOD_MS);
         //Serial.print(".");
@@ -50,9 +56,11 @@ void TaskWiFi(void *pvParam) {
       // Serial.println("");
       // Serial.println("WiFi connected.");
     }
+    xTimerStop(timer, 0);
+    vTaskResume(uploadData);
     vTaskDelay(20000 / portTICK_PERIOD_MS);
   }
-  //WiFi連線任務
+  //WiFi連線任務，若超過三分鐘尚未連線則重新啟動連線，連接到WiFi前會先暫停資料上傳的任務加速連線速度
 }
 void TaskReadPMS(void *pvParam) {
   pms.begin(9600, SERIAL_8N1, 16, 17);
@@ -109,14 +117,16 @@ void TaskUploadData(void *pvParam) {
   HTTPClient http;
   while (1) {
     vTaskDelay(2000 / portTICK_PERIOD_MS);
-    String tmpurl = (url + apiKey) + "&field1=" + String(temp, 1) + "&field2=" + String(rh) + "&field3=" + String(int(soilH)) + "&field4=" + String(pm1) + "&field5=" + String(pm25) + "&field6=" + String(pm10);
-    http.begin(tmpurl);
-    Serial.println("result = " + String(http.GET()));
-    http.end();
+    if (temp != 0 || rh != 0) {
+      String tmpurl = (url + apiKey) + "&field1=" + String(temp, 1) + "&field2=" + String(rh) + "&field3=" + String(int(soilH)) + "&field4=" + String(pm1) + "&field5=" + String(pm25) + "&field6=" + String(pm10);
+      http.begin(tmpurl);
+      http.GET();
+      http.end();
+    }
     vTaskDelay(13000 / portTICK_PERIOD_MS);
   }
   //上傳資料至Thingspeak，可依照Field不同調整tmpurl中的順序，時間可在最後vTaskDelay調整
-  //最上方預留2秒給其他感應器讀取數據
+  //最上方預留2秒給其他感應器讀取數據，同時確保有讀取到資料才上傳，若溫度與濕度為0則不上傳（尚未讀取到資料）
   //！因Thingspeak限制資料傳輸間隔最少需要15秒，因此下方至少需13000(加上方2000)才可達到15秒間隔！
 }
 void TaskOTA(void *pvParam) {
@@ -212,4 +222,8 @@ void onStart() {
 void onProgress(unsigned int progress, unsigned int total) {
   otaProgress = progress;
   otaTotal = total;
+}
+//WiFi計時器，若超過三分鐘未連線則重啟動
+void wifiRestart(TimerHandle_t xTimer) {
+  esp_restart();
 }
