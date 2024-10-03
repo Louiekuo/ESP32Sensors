@@ -6,19 +6,28 @@
 #include <HTTPClient.h>
 #include <ArduinoOTA.h>
 #include <HardwareSerial.h>
+#include <Adafruit_BMP085.h>
 #define btn2 36
+#define wifiSSID "---------"
+#define wifiPassword "---------"
+#define soilRHpin 39
+#define OTAName "---------"
+#define OTAPassword "---------"
 
-unsigned int rh = 0;                              //使用unsinged，避免溫度有負值
-float temp = 0;                                   //溫度
+
+unsigned int rh = 0, pressure = 0;                //使用unsinged，避免溫度有負值
+float temp = 0, tempB = 0;                                   //溫度
 long pm1 = 0, pm25 = 0, pm10 = 0;                 //讀取出的PM1、PM2.5、PM10數值
 float soilH = 0;                                  //土壤濕度
 int sel = 1;                                      //螢幕顯示的頁數
 int updating = 0, otaProgress = 0, otaTotal = 0;  //OTA資訊，第一個為是否正在更新，後面兩個為計算百分比所需資料
 
-String url = "https://api.thingspeak.com/update?api_key=", apiKey = "---------";
+String url = "https://api.thingspeak.com/update?api_key=", apiKey = "2QRDIJ54X2RUWC2P";
 WiFiUDP ntpUDP;
 HardwareSerial pms(2);
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
+Adafruit_BMP085 bmp;
+
 //url可依照API Key不同自行修改
 //PMS5003T使用了ESP32內建的UART，使用串口2
 //SSD1306使用I2C連接，此處需定義螢幕長度、寬度（若無reset針腳則在最後填入-1）
@@ -32,6 +41,7 @@ void setup() {
   xTaskCreate(TaskReadSoilrh, "Read Soil Sensor", 1200, NULL, 2, NULL);
   xTaskCreate(TaskUploadData, "Upload Data", 3500, NULL, 1, &uploadData);
   xTaskCreate(TaskWiFi, "WiFi connect", 3000, NULL, 1, NULL);
+  xTaskCreate(TaskReadBMP, "Read BMP180", 3000, NULL, 2, NULL);
 
   xTaskCreatePinnedToCore(TaskOTA, "OTA", 2000, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(TaskDisp, "Screen", 3000, NULL, 1, NULL, 0);
@@ -44,7 +54,7 @@ void loop() {
 
 void TaskWiFi(void *pvParam) {
   WiFi.mode(WIFI_STA);
-  WiFi.begin("---------", "---------");
+  WiFi.begin(wifiSSID, wifiPassword);
   while (1) {
     if (WiFi.status() != WL_CONNECTED) {
       vTaskSuspend(uploadData);
@@ -88,6 +98,7 @@ void TaskReadPMS(void *pvParam) {
       } else if (count == 25) {
         temp = (256.0 * high + c) / 10.0;
         temp += 3;  //溫度測得約有3度偏差
+        //使用BMP180的溫度較準確
       } else if (count == 27) {
         rh = (256 * high + c) / 10;
       }
@@ -102,7 +113,7 @@ void TaskReadPMS(void *pvParam) {
   //接著依照Datasheet的資料順序解讀出所需資料並存入上傷宣告的全域變數
 }
 void TaskReadSoilrh(void *pvParam) {
-  pinMode(39, INPUT);  //土壤濕度感測器IO39
+  pinMode(soilRHpin, INPUT);  //土壤濕度感測器IO39
   while (1) {
     soilH = analogRead(39);
     soilH = ((4095 - soilH) / 1695) * 100;
@@ -113,12 +124,22 @@ void TaskReadSoilrh(void *pvParam) {
   }
   //使用類比讀取土壤感應器濕度資料，經轉換後輸出為百分比，0為乾燥，100為潮濕
 }
+
+void TaskReadBMP(void *param) {
+  bmp.begin();
+  while (1) {
+    tempB = bmp.readTemperature();
+    pressure = bmp.readPressure();
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
 void TaskUploadData(void *pvParam) {
   HTTPClient http;
   while (1) {
     vTaskDelay(2000 / portTICK_PERIOD_MS);
     if (temp != 0 || rh != 0) {
-      String tmpurl = (url + apiKey) + "&field1=" + String(temp, 1) + "&field2=" + String(rh) + "&field3=" + String(int(soilH)) + "&field4=" + String(pm1) + "&field5=" + String(pm25) + "&field6=" + String(pm10);
+      String tmpurl = (url + apiKey) + "&field1=" + String(tempB, 1) + "&field2=" + String(rh) + "&field3=" + String(int(soilH)) + "&field4=" + String(pm1) + "&field5=" + String(pm25) + "&field6=" + String(pm10) + "&field7=" + String(pressure);
       http.begin(tmpurl);
       http.GET();
       http.end();
@@ -130,8 +151,8 @@ void TaskUploadData(void *pvParam) {
   //！因Thingspeak限制資料傳輸間隔最少需要15秒，因此下方至少需13000(加上方2000)才可達到15秒間隔！
 }
 void TaskOTA(void *pvParam) {
-  ArduinoOTA.setHostname("---------");
-  ArduinoOTA.setPassword("---------");
+  ArduinoOTA.setHostname(OTAName);
+  ArduinoOTA.setPassword(OTAPassword);
   ArduinoOTA.onStart(onStart);
   ArduinoOTA.onProgress(onProgress);
   ArduinoOTA.begin();
@@ -151,7 +172,7 @@ void TaskButton(void *pvParam) {
         sel++;
       }
     }
-    if (sel > 4) {
+    if (sel > 5) {
       sel = 1;
     }
     vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -173,8 +194,8 @@ void TaskDisp(void *pvParam) {
       display.println(String(otaProgress / (otaTotal / 100)) + "%");
       display.display();
     } else {
+      display.clearDisplay();
       if (sel == 1) {
-        display.clearDisplay();
         display.setTextSize(2);
         display.setTextColor(1);
         display.setCursor(0, 4);
@@ -183,18 +204,25 @@ void TaskDisp(void *pvParam) {
         display.println("PM2.5:" + String(pm25));
         display.setCursor(0, 44);
         display.println("PM10 :" + String(pm10));
-        display.display();
       } else if (sel == 2) {
-        display.clearDisplay();
         display.setTextSize(2);
         display.setTextColor(1);
         display.setCursor(0, 4);
-        display.println(String(temp, 1) + " C");
+        display.println("PMS5003T:");
         display.setCursor(0, 24);
+        display.println(String(temp, 1) + " C");
+        display.setCursor(0, 44);
         display.println(String(rh) + "  RH");
-        display.display();
       } else if (sel == 3) {
-        display.clearDisplay();
+        display.setTextSize(2);
+        display.setTextColor(1);
+        display.setCursor(0, 4);
+        display.println("BMP180:");
+        display.setCursor(0, 24);
+        display.println(String(tempB ,1) + "   C");
+        display.setCursor(0, 44);
+        display.println(String(pressure) + " Pa");
+      } else if (sel == 4) {
         display.setTextSize(2);
         display.setTextColor(1);
         display.setCursor(0, 4);
@@ -203,11 +231,9 @@ void TaskDisp(void *pvParam) {
         display.println("RSSI:" + String(WiFi.RSSI()));
         display.setCursor(0, 44);
         display.println("RAM:" + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
-        display.display();
-      } else if (sel == 4) {
-        display.clearDisplay();
-        display.display();
+      } else if (sel == 5) {
       }
+      display.display();
       vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
   }
@@ -227,3 +253,4 @@ void onProgress(unsigned int progress, unsigned int total) {
 void wifiRestart(TimerHandle_t xTimer) {
   esp_restart();
 }
+
