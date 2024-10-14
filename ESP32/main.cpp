@@ -1,3 +1,4 @@
+#include <PubSubClient.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
 #include <Wire.h>
@@ -7,19 +8,25 @@
 #include <ArduinoOTA.h>
 #include <HardwareSerial.h>
 #include <Adafruit_BMP085.h>
-#define btn2 36
+#define btn2 32
 #define wifiSSID "---------"
 #define wifiPassword "---------"
 #define soilRHpin 39
 #define OTAName "---------"
 #define OTAPassword "---------"
 
+#define MQTTServer "mqttgo.io"  //MQTT伺服器(使用台灣的免費伺服器，無加密功能)
+#define MQTTPort 1883           //MQTT Port
+// #define MQTTUser ""
+// #define MQTTPassword "";
+#define clintID "esp32-731444467145"
+
 
 unsigned int rh = 0, pressure = 0;                //使用unsinged，避免溫度有負值
-float temp = 0, tempB = 0;                                   //溫度
+float temp = 0, tempB = 0;                        //溫度（PMS5003T、BMP180）
 long pm1 = 0, pm25 = 0, pm10 = 0;                 //讀取出的PM1、PM2.5、PM10數值
-float soilH = 0;                                  //土壤濕度
-int sel = 1;                                      //螢幕顯示的頁數
+float soilH = 0, oringalSoilH = 0;                //土壤濕度
+int sel = 4;                                      //螢幕顯示的頁數
 int updating = 0, otaProgress = 0, otaTotal = 0;  //OTA資訊，第一個為是否正在更新，後面兩個為計算百分比所需資料
 
 String url = "https://api.thingspeak.com/update?api_key=", apiKey = "2QRDIJ54X2RUWC2P";
@@ -27,6 +34,9 @@ WiFiUDP ntpUDP;
 HardwareSerial pms(2);
 Adafruit_SSD1306 display(128, 64, &Wire, -1);
 Adafruit_BMP085 bmp;
+WiFiClient WifiClient;                // 建立 WiFiClient 物件
+PubSubClient MQTTClient(WifiClient);  // 基於 WiFiClient 物件，建立 MQTTClient 物件
+
 
 //url可依照API Key不同自行修改
 //PMS5003T使用了ESP32內建的UART，使用串口2
@@ -46,6 +56,7 @@ void setup() {
   xTaskCreatePinnedToCore(TaskOTA, "OTA", 2000, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(TaskDisp, "Screen", 3000, NULL, 1, NULL, 0);
   xTaskCreatePinnedToCore(TaskButton, "Button", 2000, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(TaskMQTT, "MQTT Service", 4000, NULL, 1, NULL, 0);
 
   timer = xTimerCreate("WiFi connection timer", (180000 / portTICK_PERIOD_MS), pdFALSE, (void *)1, wifiRestart);
 }
@@ -61,10 +72,7 @@ void TaskWiFi(void *pvParam) {
       xTimerStart(timer, 0);
       while (WiFi.status() != WL_CONNECTED) {
         vTaskDelay(100 / portTICK_PERIOD_MS);
-        //Serial.print(".");
       }
-      // Serial.println("");
-      // Serial.println("WiFi connected.");
     }
     xTimerStop(timer, 0);
     vTaskResume(uploadData);
@@ -115,8 +123,9 @@ void TaskReadPMS(void *pvParam) {
 void TaskReadSoilrh(void *pvParam) {
   pinMode(soilRHpin, INPUT);  //土壤濕度感測器IO39
   while (1) {
-    soilH = analogRead(39);
-    soilH = ((4095 - soilH) / 1695) * 100;
+    soilH = analogRead(soilRHpin);
+    oringalSoilH = soilH;
+    soilH = ((4095 - soilH) / 2495) * 100;
     if (soilH > 100) {
       soilH = 100;
     }
@@ -130,9 +139,9 @@ void TaskReadBMP(void *param) {
   while (1) {
     tempB = bmp.readTemperature();
     pressure = bmp.readPressure();
-
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
+  //BMP180大氣壓力與溫度感應器，每秒讀取一次
 }
 void TaskUploadData(void *pvParam) {
   HTTPClient http;
@@ -150,6 +159,27 @@ void TaskUploadData(void *pvParam) {
   //最上方預留2秒給其他感應器讀取數據，同時確保有讀取到資料才上傳，若溫度與濕度為0則不上傳（尚未讀取到資料）
   //！因Thingspeak限制資料傳輸間隔最少需要15秒，因此下方至少需13000(加上方2000)才可達到15秒間隔！
 }
+
+void TaskMQTT(void *pvParam) {
+  MQTTClient.setServer(MQTTServer, MQTTPort);
+  while (1) {
+    if (!MQTTClient.connected()) {
+      while (!MQTTClient.connected()) {
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+      }
+    } else {
+      MQTTClient.publish("---------/esp32/temp", String(tempB, 1).c_str());
+      MQTTClient.publish("---------/esp32/rh", String(rh).c_str());
+      MQTTClient.publish("---------/esp32/soilH", String(soilH).c_str());
+      MQTTClient.publish("---------/esp32/pm1", String(pm1).c_str());
+      MQTTClient.publish("---------/esp32/pm25", String(pm25).c_str());
+      MQTTClient.publish("---------/esp32/pm10", String(pm10).c_str());
+      MQTTClient.publish("---------/esp32/pressure", String(pressure).c_str());
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
 void TaskOTA(void *pvParam) {
   ArduinoOTA.setHostname(OTAName);
   ArduinoOTA.setPassword(OTAPassword);
@@ -164,7 +194,7 @@ void TaskOTA(void *pvParam) {
   //可自訂名稱與密碼，onStart與onProgress用於讓螢幕顯示OTA進度
 }
 void TaskButton(void *pvParam) {
-  pinMode(btn2, INPUT);
+  pinMode(btn2, INPUT_PULLUP);
   while (1) {
     if (digitalRead(btn2) == LOW) {
       vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -208,20 +238,20 @@ void TaskDisp(void *pvParam) {
         display.setTextSize(2);
         display.setTextColor(1);
         display.setCursor(0, 4);
-        display.println("PMS5003T:");
+        display.println(String(tempB, 1) + "   C");
         display.setCursor(0, 24);
-        display.println(String(temp, 1) + " C");
+        display.println(String(rh) + "     RH");
         display.setCursor(0, 44);
-        display.println(String(rh) + "  RH");
+        display.println(String(pressure) + " Pa");
       } else if (sel == 3) {
         display.setTextSize(2);
         display.setTextColor(1);
         display.setCursor(0, 4);
-        display.println("BMP180:");
+        display.println("Soil RH:");
         display.setCursor(0, 24);
-        display.println(String(tempB ,1) + "   C");
+        display.println(String(soilH) + "   %");
         display.setCursor(0, 44);
-        display.println(String(pressure) + " Pa");
+        display.println(String(oringalSoilH));
       } else if (sel == 4) {
         display.setTextSize(2);
         display.setTextColor(1);
@@ -230,7 +260,7 @@ void TaskDisp(void *pvParam) {
         display.setCursor(0, 24);
         display.println("RSSI:" + String(WiFi.RSSI()));
         display.setCursor(0, 44);
-        display.println("RAM:" + String(heap_caps_get_free_size(MALLOC_CAP_8BIT)));
+        display.println("MQTT:" + String(MQTTClient.state()));
       } else if (sel == 5) {
       }
       display.display();
@@ -238,7 +268,7 @@ void TaskDisp(void *pvParam) {
     }
   }
   //螢幕顯示任務，外圈的if用來辨識是否在更新，若正在更新則顯示更新進度
-  //若未在更新，則進入螢幕顯示，1為懸浮微粒資料，2為溫濕度資料，3為WiFi連接狀態、訊息與記憶體剩餘大小，4為關閉螢幕
+  //若未在更新，則進入螢幕顯示，1為懸浮微粒資料，2為溫濕度資料，3為土壤濕度百分比與原始數據、4為WiFi連接狀態、強度與MQTT狀態，5為關閉螢幕
 }
 
 //ArduinoOTA螢幕顯示參數
@@ -253,4 +283,3 @@ void onProgress(unsigned int progress, unsigned int total) {
 void wifiRestart(TimerHandle_t xTimer) {
   esp_restart();
 }
-
